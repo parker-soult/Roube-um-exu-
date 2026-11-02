@@ -1,0 +1,982 @@
+--[[
+    Akuma/zyrox Hub - Roube um Exu (v2)
+    Devs: Akuma & Loirine
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ======================== CONFIG ========================
+local CONFIG = {
+    Prefix = "exu",                  -- modelos cujo nome começa com isso
+    TweenSpeed = 300,                -- studs por segundo
+    ReachDistance = 8,               -- distância para considerar que chegou no alvo
+    PromptRetries = 4,               -- quantas vezes tenta disparar o prompt de roubo
+    FailCooldown = 15,               -- segundos para o Farm ignorar um alvo já tentado
+    Debug = false,                   -- true = imprime logs no console (F9)
+    RarityKeys = { "Rarity", "Raridade", "rarity", "raridade" },
+    KnownRarities = {
+        "Comum", "Incomum", "Raro", "Epico", "Épico", "Lendario", "Lendário",
+        "Mitico", "Mítico", "Secreto", "Divino", "Celestial",
+        "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Divine",
+    },
+    UnknownRarity = "Desconhecida",
+    -- Texto do ProximityPrompt que indica roubo (aceita parte da palavra, minúsculo)
+    PromptKeywords = { "roub", "steal", "pegar", "take", "grab" },
+    -- Prompts com esses textos são ignorados (evita comprar sem querer)
+    BlockKeywords = { "compr", "buy", "purchase" },
+    ToggleKey = Enum.KeyCode.RightControl,
+}
+
+local COLORS = {
+    Black = Color3.fromRGB(10, 8, 16),
+    Panel = Color3.fromRGB(20, 14, 32),
+    Row = Color3.fromRGB(30, 20, 48),
+    RowHover = Color3.fromRGB(58, 30, 96),
+    Purple = Color3.fromRGB(138, 43, 226),
+    LightPurple = Color3.fromRGB(190, 120, 255),
+    Text = Color3.fromRGB(235, 225, 250),
+    Red = Color3.fromRGB(190, 40, 70),
+    Muted = Color3.fromRGB(50, 40, 70),
+}
+
+-- ======================== LIMPEZA DE EXECUÇÃO ANTERIOR ========================
+local genv = (typeof(getgenv) == "function" and getgenv()) or _G
+if genv.AkumaZyroxUnload then
+    pcall(genv.AkumaZyroxUnload)
+end
+
+-- ======================== ESTADO ========================
+local State = {
+    Alive = true,
+    Busy = false,
+    Farm = false,
+    FarmRarity = nil,
+    Base = nil,
+    Entries = {},
+    Count = 0,
+    Cooldown = {},
+    Done = {},
+}
+local Connections = {}
+
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(Connections, c)
+    return c
+end
+
+local function dbg(...)
+    if CONFIG.Debug then
+        warn("[Akuma/zyrox]", ...)
+    end
+end
+
+-- ======================== UTILITÁRIOS ========================
+local function clean(s)
+    return (tostring(s or ""):gsub("<[^>]+>", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function norm(s)
+    return (clean(s):lower())
+end
+
+local KnownSet = {}
+for _, k in ipairs(CONFIG.KnownRarities) do
+    KnownSet[norm(k)] = true
+end
+
+local function stripLabel(text)
+    text = clean(text)
+    local after = text:match("^[^:]+:%s*(.+)$")
+    return after and clean(after) or text
+end
+
+local function textHas(text, list)
+    text = tostring(text or ""):lower()
+    for _, k in ipairs(list) do
+        if text:find(k, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function getCharRoot()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if hum and hum.Health > 0 and root then
+        return root, hum, char
+    end
+    return nil
+end
+
+local function getModelRoot(model)
+    return model.PrimaryPart
+        or model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getRarity(model)
+    for _, key in ipairs(CONFIG.RarityKeys) do
+        local attr = model:GetAttribute(key)
+        if attr ~= nil and clean(attr) ~= "" then
+            return clean(attr)
+        end
+    end
+
+    for _, d in ipairs(model:GetDescendants()) do
+        local lname = d.Name:lower()
+        if lname:find("rarity", 1, true) or lname:find("raridade", 1, true) then
+            if d:IsA("StringValue") and d.Value ~= "" then
+                return clean(d.Value)
+            elseif (d:IsA("TextLabel") or d:IsA("TextButton")) and clean(d.Text) ~= "" then
+                return stripLabel(d.Text)
+            end
+            for _, key in ipairs(CONFIG.RarityKeys) do
+                local a = d:GetAttribute(key)
+                if a ~= nil and clean(a) ~= "" then
+                    return clean(a)
+                end
+            end
+        end
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local t = stripLabel(d.Text)
+            if KnownSet[norm(t)] then
+                return t
+            end
+        end
+    end
+
+    local parent = model.Parent
+    if parent and parent ~= Workspace and KnownSet[norm(parent.Name)] then
+        return clean(parent.Name)
+    end
+    return CONFIG.UnknownRarity
+end
+
+local function findPrompt(model)
+    local best, bestScore = nil, 0
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local txt = d.ActionText .. " " .. d.ObjectText .. " " .. d.Name
+            if not textHas(txt, CONFIG.BlockKeywords) then
+                local score = textHas(txt, CONFIG.PromptKeywords) and 2 or 1
+                if d.Enabled then
+                    score += 0.5
+                end
+                if score > bestScore then
+                    best, bestScore = d, score
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function getPromptPosition(prompt, model)
+    local p = prompt and prompt.Parent
+    if p then
+        if p:IsA("BasePart") then
+            return p.Position
+        elseif p:IsA("Attachment") then
+            return p.WorldPosition
+        elseif p:IsA("Model") then
+            local r = getModelRoot(p)
+            if r then return r.Position end
+        end
+    end
+    local r = getModelRoot(model)
+    return r and r.Position or nil
+end
+
+local function triggerPrompt(prompt, model)
+    local oldHold = prompt.HoldDuration
+    local oldLos = prompt.RequiresLineOfSight
+    local oldDist = prompt.MaxActivationDistance
+    local startText = prompt.ActionText
+
+    pcall(function()
+        prompt.HoldDuration = 0
+        prompt.RequiresLineOfSight = false
+        prompt.MaxActivationDistance = math.max(oldDist, 20)
+    end)
+
+    local fired = 0
+    for i = 1, CONFIG.PromptRetries do
+        if typeof(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, prompt)
+        else
+            pcall(function()
+                prompt:InputHoldBegin()
+                task.wait(math.max(oldHold, 0) + 0.1)
+                prompt:InputHoldEnd()
+            end)
+        end
+        fired += 1
+        dbg("prompt disparado", i, prompt:GetFullName())
+        task.wait(0.12)
+        if not model:IsDescendantOf(Workspace)
+            or not prompt:IsDescendantOf(Workspace)
+            or not prompt.Enabled
+            or prompt.ActionText ~= startText then
+            break
+        end
+    end
+
+    pcall(function()
+        prompt.HoldDuration = oldHold
+        prompt.RequiresLineOfSight = oldLos
+        prompt.MaxActivationDistance = oldDist
+    end)
+    return fired > 0
+end
+
+-- ======================== TWEEN ========================
+local function tweenTo(targetCF)
+    local root, hum, char = getCharRoot()
+    if not root then return false end
+
+    local parts = {}
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then
+            parts[#parts + 1] = p
+        end
+    end
+
+    local dist = (root.Position - targetCF.Position).Magnitude
+    local duration = math.max(dist / CONFIG.TweenSpeed, 0.03)
+    local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), { CFrame = targetCF })
+
+    local finished = false
+    local doneConn = tween.Completed:Connect(function()
+        finished = true
+    end)
+
+    local oldPlatform = hum.PlatformStand
+    hum.PlatformStand = true
+    local stepConn = RunService.Stepped:Connect(function()
+        for _, p in ipairs(parts) do
+            if p.Parent then
+                p.CanCollide = false
+            end
+        end
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+
+    tween:Play()
+    local started = os.clock()
+    while not finished and State.Alive do
+        if hum.Health <= 0 or not root.Parent then break end
+        if os.clock() - started > duration + 3 then break end
+        RunService.Heartbeat:Wait()
+    end
+    if not finished then
+        tween:Cancel()
+    end
+
+    doneConn:Disconnect()
+    stepConn:Disconnect()
+    if hum.Parent then
+        hum.PlatformStand = oldPlatform
+    end
+    if root.Parent then
+        root.AssemblyLinearVelocity = Vector3.zero
+    end
+    return finished
+end
+
+-- ======================== GUI BASE ========================
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do
+        inst[k] = v
+    end
+    inst.Parent = parent
+    return inst
+end
+
+local function corner(parent, r)
+    return new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, parent)
+end
+
+local function stroke(parent, color, thickness)
+    return new("UIStroke", { Color = color or COLORS.Purple, Thickness = thickness or 1.5 }, parent)
+end
+
+local ScreenGui = new("ScreenGui", {
+    Name = "AkumaZyroxHub",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+do
+    pcall(function()
+        if syn and syn.protect_gui then
+            syn.protect_gui(ScreenGui)
+        end
+    end)
+    local target
+    if typeof(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok then target = h end
+    end
+    if not target then
+        local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+        if ok then target = cg end
+    end
+    if target then
+        pcall(function() ScreenGui.Parent = target end)
+    end
+    if not ScreenGui.Parent then
+        ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+end
+
+local Main = new("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(640, 400),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    BackgroundColor3 = COLORS.Black,
+    BorderSizePixel = 0,
+}, ScreenGui)
+corner(Main, 12)
+stroke(Main, COLORS.Purple, 2)
+
+local Scale = new("UIScale", { Scale = 1 }, Main)
+do
+    local cam = Workspace.CurrentCamera
+    if cam then
+        local vs = cam.ViewportSize
+        Scale.Scale = math.clamp(math.min((vs.X - 20) / 640, (vs.Y - 20) / 400), 0.4, 1)
+    end
+end
+
+-- Botão flutuante (mobile / sem teclado)
+local Float = new("TextButton", {
+    Size = UDim2.fromOffset(44, 44),
+    Position = UDim2.new(0, 12, 0.5, -22),
+    BackgroundColor3 = COLORS.Black,
+    Text = "AZ",
+    TextColor3 = COLORS.LightPurple,
+    Font = Enum.Font.GothamBold,
+    TextSize = 16,
+}, ScreenGui)
+corner(Float, 22)
+stroke(Float, COLORS.Purple, 2)
+Float.MouseButton1Click:Connect(function()
+    Main.Visible = not Main.Visible
+end)
+
+-- Header
+local Header = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 38),
+    BackgroundColor3 = COLORS.Panel,
+    BorderSizePixel = 0,
+}, Main)
+corner(Header, 12)
+new("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(70, 20, 120), Color3.fromRGB(15, 10, 25)),
+    Rotation = 0,
+}, Header)
+
+new("TextLabel", {
+    Size = UDim2.new(1, -90, 1, 0),
+    Position = UDim2.fromOffset(14, 0),
+    BackgroundTransparency = 1,
+    Text = "Akuma/zyrox Hub",
+    TextColor3 = COLORS.LightPurple,
+    Font = Enum.Font.GothamBold,
+    TextSize = 18,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, Header)
+
+local function headerButton(text, xOffset, color)
+    local b = new("TextButton", {
+        Size = UDim2.fromOffset(28, 24),
+        Position = UDim2.new(1, xOffset, 0.5, -12),
+        BackgroundColor3 = color,
+        Text = text,
+        TextColor3 = COLORS.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 16,
+        AutoButtonColor = true,
+    }, Header)
+    corner(b, 6)
+    return b
+end
+
+local MinBtn = headerButton("-", -68, COLORS.Purple)
+local CloseBtn = headerButton("X", -36, COLORS.Red)
+
+local Body = new("Frame", {
+    Size = UDim2.new(1, 0, 1, -38),
+    Position = UDim2.fromOffset(0, 38),
+    BackgroundTransparency = 1,
+}, Main)
+
+-- Arrastar
+do
+    local dragging, dragStart, startPos = false, nil, nil
+    connect(Header.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = Main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+-- ======================== PAINEL ESQUERDO ========================
+local Left = new("Frame", {
+    Size = UDim2.new(0, 270, 1, -16),
+    Position = UDim2.fromOffset(8, 8),
+    BackgroundColor3 = COLORS.Panel,
+    BorderSizePixel = 0,
+}, Body)
+corner(Left, 10)
+stroke(Left, COLORS.Purple, 1)
+new("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+    HorizontalAlignment = Enum.HorizontalAlignment.Center,
+}, Left)
+new("UIPadding", { PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10) }, Left)
+
+local function label(text, height, order, color, size)
+    return new("TextLabel", {
+        Size = UDim2.new(1, -20, 0, height),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = color or COLORS.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = size or 14,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = order,
+    }, Left)
+end
+
+local function button(text, order, callback)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, -20, 0, 36),
+        BackgroundColor3 = COLORS.Purple,
+        Text = text,
+        TextColor3 = COLORS.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        AutoButtonColor = true,
+        LayoutOrder = order,
+    }, Left)
+    corner(b, 8)
+    b.MouseButton1Click:Connect(callback)
+    return b
+end
+
+local StatusLabel = label("Status: Pronto", 38, 1, COLORS.LightPurple, 14)
+local CountLabel = label("Exus no mapa: 0", 20, 2, COLORS.Text, 14)
+
+local function setStatus(text)
+    StatusLabel.Text = "Status: " .. tostring(text)
+end
+
+local FarmBtn
+local RarityBtn
+local Drop
+
+local function getRarityList()
+    local seen, list = {}, {}
+    for _, e in pairs(State.Entries) do
+        local k = norm(e.Rarity)
+        if not seen[k] then
+            seen[k] = true
+            table.insert(list, e.Rarity)
+        end
+    end
+    table.sort(list, function(a, b) return norm(a) < norm(b) end)
+    return list
+end
+
+local function refreshRarityButton()
+    RarityBtn.Text = "Raridade: " .. (State.FarmRarity or "Selecione") .. "  v"
+end
+
+local function refreshFarmButton()
+    FarmBtn.Text = "Farm AFK: " .. (State.Farm and "ON" or "OFF")
+    FarmBtn.BackgroundColor3 = State.Farm and COLORS.Purple or COLORS.Muted
+end
+
+FarmBtn = button("Farm AFK: OFF", 3, function()
+    if not State.Farm and not State.FarmRarity then
+        setStatus("Selecione uma raridade antes")
+        return
+    end
+    State.Farm = not State.Farm
+    refreshFarmButton()
+    setStatus(State.Farm and ("Farm AFK ativo: " .. State.FarmRarity) or "Farm AFK desligado")
+end)
+
+RarityBtn = button("Raridade: Selecione  v", 4, function()
+    if Drop.Visible then
+        Drop.Visible = false
+        return
+    end
+
+    for _, c in ipairs(Drop:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+
+    local list = getRarityList()
+    if #list == 0 then
+        setStatus("Nenhuma raridade detectada ainda")
+        return
+    end
+
+    for i, r in ipairs(list) do
+        local opt = new("TextButton", {
+            Size = UDim2.new(1, -8, 0, 28),
+            BackgroundColor3 = COLORS.Row,
+            Text = r,
+            TextColor3 = COLORS.Text,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 13,
+            LayoutOrder = i,
+            ZIndex = 21,
+        }, Drop)
+        corner(opt, 6)
+        opt.MouseButton1Click:Connect(function()
+            State.FarmRarity = r
+            refreshRarityButton()
+            Drop.Visible = false
+            if State.Farm then
+                setStatus("Farm AFK ativo: " .. r)
+            end
+        end)
+    end
+
+    local s = math.max(Scale.Scale, 0.01)
+    local relX = (RarityBtn.AbsolutePosition.X - Main.AbsolutePosition.X) / s
+    local relY = (RarityBtn.AbsolutePosition.Y - Main.AbsolutePosition.Y + RarityBtn.AbsoluteSize.Y) / s + 2
+    Drop.Position = UDim2.fromOffset(relX, relY)
+    Drop.Size = UDim2.fromOffset(250, math.min(#list * 32 + 8, 150))
+    Drop.Visible = true
+end)
+RarityBtn.BackgroundColor3 = COLORS.Muted
+stroke(RarityBtn, COLORS.Purple, 1)
+refreshFarmButton()
+
+button("Definir Base (posição atual)", 5, function()
+    local root = getCharRoot()
+    if root then
+        State.Base = root.CFrame
+        setStatus("Base definida")
+    else
+        setStatus("Personagem indisponível")
+    end
+end)
+
+label("Velocidade do tween: " .. CONFIG.TweenSpeed, 20, 6, COLORS.Text, 13)
+label("Devs: Akuma & Loirine", 20, 7, COLORS.LightPurple, 13)
+label("Esconder/mostrar: RightControl ou botão AZ", 20, 8, Color3.fromRGB(140, 120, 170), 12)
+
+-- Dropdown de raridade
+Drop = new("ScrollingFrame", {
+    Name = "RarityDrop",
+    Size = UDim2.fromOffset(250, 100),
+    BackgroundColor3 = COLORS.Panel,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = COLORS.Purple,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    Visible = false,
+    ZIndex = 20,
+}, Main)
+corner(Drop, 8)
+stroke(Drop, COLORS.Purple, 1)
+new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, Drop)
+new("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4) }, Drop)
+
+-- ======================== PAINEL DIREITO ========================
+local Right = new("Frame", {
+    Size = UDim2.new(1, -294, 1, -16),
+    Position = UDim2.fromOffset(286, 8),
+    BackgroundColor3 = COLORS.Panel,
+    BorderSizePixel = 0,
+}, Body)
+corner(Right, 10)
+stroke(Right, COLORS.Purple, 1)
+
+new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 26),
+    Position = UDim2.fromOffset(10, 6),
+    BackgroundTransparency = 1,
+    Text = "Exus no mapa (clique para roubar)",
+    TextColor3 = COLORS.LightPurple,
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, Right)
+
+local List = new("ScrollingFrame", {
+    Size = UDim2.new(1, -12, 1, -42),
+    Position = UDim2.fromOffset(6, 36),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 4,
+    ScrollBarImageColor3 = COLORS.Purple,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, Right)
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, List)
+
+-- ======================== ROUBO ========================
+local function steal(entry)
+    if State.Busy or not State.Alive then return end
+    local model = entry.Model
+    if not model or not model:IsDescendantOf(Workspace) then return end
+
+    local myRoot = getCharRoot()
+    if not myRoot then
+        setStatus("Personagem indisponível")
+        return
+    end
+
+    State.Busy = true
+    Drop.Visible = false
+    if not State.Base then
+        State.Base = myRoot.CFrame
+    end
+    setStatus("Indo até " .. entry.Name)
+
+    local stolen = false
+    local ok, err = pcall(function()
+        local prompt = findPrompt(model)
+        if not prompt then
+            error("alvo sem prompt de roubo", 0)
+        end
+
+        local reached = false
+        for _ = 1, 6 do
+            if not model:IsDescendantOf(Workspace) then
+                error("alvo sumiu", 0)
+            end
+            if not prompt:IsDescendantOf(Workspace) then
+                prompt = findPrompt(model)
+                if not prompt then error("prompt sumiu", 0) end
+            end
+
+            local pos = getPromptPosition(prompt, model)
+            if not pos then
+                error("sem posição do alvo", 0)
+            end
+            if not tweenTo(CFrame.new(pos + Vector3.new(0, 1.5, 0))) then
+                error("movimento interrompido", 0)
+            end
+
+            local r = getCharRoot()
+            local np = getPromptPosition(prompt, model)
+            if r and np and (r.Position - np).Magnitude <= CONFIG.ReachDistance then
+                reached = true
+                break
+            end
+        end
+        if not reached then
+            error("não alcançou o alvo", 0)
+        end
+
+        setStatus("Roubando " .. entry.Name)
+        stolen = triggerPrompt(prompt, model)
+    end)
+
+    -- Fuga imediata: volta pra base sem esperar nada (o boss começa a perseguir ao roubar)
+    setStatus("Fugindo pra base...")
+    if State.Alive and State.Base then
+        for _ = 1, 3 do
+            if not getCharRoot() then break end
+            if tweenTo(State.Base) then break end
+        end
+    end
+
+    State.Cooldown[model] = os.clock() + CONFIG.FailCooldown
+    if ok and stolen then
+        State.Done[model] = true
+    end
+    State.Busy = false
+
+    if State.Alive then
+        setStatus(ok and ("Roubo enviado: " .. entry.Name) or ("Falhou: " .. tostring(err)))
+    end
+    dbg("steal", entry.Name, ok, err)
+end
+
+-- ======================== ENTRADAS (LISTA) ========================
+local function buildPhoto(vp, model)
+    local ok, err = pcall(function()
+        local prev = model.Archivable
+        model.Archivable = true
+        local clone = model:Clone()
+        model.Archivable = prev
+        if not clone then error("clone falhou") end
+
+        for _, d in ipairs(clone:GetDescendants()) do
+            if d:IsA("BaseScript") or d:IsA("ProximityPrompt") or d:IsA("BillboardGui")
+                or d:IsA("Sound") or d:IsA("ParticleEmitter") then
+                d:Destroy()
+            end
+        end
+        clone.Parent = vp
+
+        local cf, size = clone:GetBoundingBox()
+        local cam = Instance.new("Camera")
+        local dist = math.max(size.Magnitude, 1) * 1.1
+        local camPos = cf.Position + cf.LookVector * dist + Vector3.new(0, size.Y * 0.1, 0)
+        cam.CFrame = CFrame.new(camPos, cf.Position)
+        cam.Parent = vp
+        vp.CurrentCamera = cam
+    end)
+    if not ok then
+        dbg("foto falhou", err)
+        new("TextLabel", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Text = "?",
+            TextColor3 = COLORS.LightPurple,
+            Font = Enum.Font.GothamBold,
+            TextSize = 24,
+        }, vp)
+    end
+end
+
+local function removeEntry(model)
+    local e = State.Entries[model]
+    if not e then return end
+    State.Entries[model] = nil
+    State.Cooldown[model] = nil
+    State.Done[model] = nil
+    State.Count = State.Count - 1
+    if e.Row then e.Row:Destroy() end
+end
+
+local function addEntry(model)
+    if State.Entries[model] or not model:IsDescendantOf(Workspace) then return end
+
+    local entry = { Model = model, Name = model.Name, Rarity = getRarity(model) }
+
+    local row = new("Frame", {
+        Size = UDim2.new(1, -8, 0, 64),
+        BackgroundColor3 = COLORS.Row,
+        BorderSizePixel = 0,
+    }, List)
+    corner(row, 8)
+    stroke(row, COLORS.Purple, 1)
+
+    local vp = new("ViewportFrame", {
+        Size = UDim2.fromOffset(52, 52),
+        Position = UDim2.fromOffset(6, 6),
+        BackgroundColor3 = COLORS.Black,
+        BorderSizePixel = 0,
+        Ambient = Color3.fromRGB(200, 200, 200),
+        LightColor = Color3.fromRGB(255, 255, 255),
+    }, row)
+    corner(vp, 6)
+    buildPhoto(vp, model)
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -74, 0, 22),
+        Position = UDim2.fromOffset(66, 8),
+        BackgroundTransparency = 1,
+        Text = entry.Name,
+        TextColor3 = COLORS.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+
+    local rarLbl = new("TextLabel", {
+        Size = UDim2.new(1, -74, 0, 20),
+        Position = UDim2.fromOffset(66, 34),
+        BackgroundTransparency = 1,
+        Text = "Raridade: " .. entry.Rarity,
+        TextColor3 = COLORS.LightPurple,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+
+    local click = new("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "",
+        ZIndex = 5,
+    }, row)
+    click.MouseEnter:Connect(function() row.BackgroundColor3 = COLORS.RowHover end)
+    click.MouseLeave:Connect(function() row.BackgroundColor3 = COLORS.Row end)
+    click.MouseButton1Click:Connect(function()
+        task.spawn(steal, entry)
+    end)
+
+    entry.Row = row
+    entry.RarityLabel = rarLbl
+    State.Entries[model] = entry
+    State.Count = State.Count + 1
+    dbg("Exu detectado", model:GetFullName(), entry.Rarity)
+
+    connect(model.AncestryChanged, function()
+        if not model:IsDescendantOf(Workspace) then
+            removeEntry(model)
+        end
+    end)
+end
+
+local function hasPrefix(name)
+    return name:lower():sub(1, #CONFIG.Prefix) == CONFIG.Prefix
+end
+
+local function considerInstance(inst)
+    if not inst:IsA("Model") or not hasPrefix(inst.Name) then return end
+    if Players:GetPlayerFromCharacter(inst) then return end
+
+    -- ignora sub-modelos de um Exu (acessórios etc.)
+    local p = inst.Parent
+    while p and p ~= Workspace do
+        if p:IsA("Model") and hasPrefix(p.Name) then return end
+        p = p.Parent
+    end
+
+    task.delay(0.3, function()
+        if not State.Alive or not inst:IsDescendantOf(Workspace) then return end
+        for _, c in ipairs(inst:GetChildren()) do
+            if c:IsA("Model") and hasPrefix(c.Name) then return end -- é um container
+        end
+        if not inst:FindFirstChildWhichIsA("BasePart", true) then return end
+        addEntry(inst)
+    end)
+end
+
+for _, d in ipairs(Workspace:GetDescendants()) do
+    considerInstance(d)
+end
+connect(Workspace.DescendantAdded, considerInstance)
+
+-- ======================== LOOPS ========================
+-- Atualiza raridade, contador e valida entradas
+task.spawn(function()
+    while State.Alive do
+        for model, e in pairs(State.Entries) do
+            if not model:IsDescendantOf(Workspace) then
+                removeEntry(model)
+            else
+                local r = getRarity(model)
+                if r ~= e.Rarity then
+                    e.Rarity = r
+                    e.RarityLabel.Text = "Raridade: " .. r
+                end
+            end
+        end
+        CountLabel.Text = "Exus no mapa: " .. State.Count
+        task.wait(1.5)
+    end
+end)
+
+-- Farm AFK
+task.spawn(function()
+    while State.Alive do
+        task.wait(0.4)
+        if State.Farm and State.FarmRarity and not State.Busy then
+            local myRoot = getCharRoot()
+            if myRoot then
+                local best, bestDist
+                local now = os.clock()
+                for model, e in pairs(State.Entries) do
+                    if norm(e.Rarity) == norm(State.FarmRarity)
+                        and not State.Done[model]
+                        and (State.Cooldown[model] or 0) <= now
+                        and model:IsDescendantOf(Workspace) then
+                        local prompt = findPrompt(model)
+                        if prompt and prompt.Enabled then
+                            local pos = getPromptPosition(prompt, model)
+                            if pos then
+                                local d = (pos - myRoot.Position).Magnitude
+                                if not bestDist or d < bestDist then
+                                    best, bestDist = e, d
+                                end
+                            end
+                        end
+                    end
+                end
+                if best then
+                    steal(best)
+                else
+                    setStatus("Farm AFK: aguardando " .. State.FarmRarity)
+                end
+            end
+        end
+    end
+end)
+
+-- ======================== CONTROLES ========================
+local minimized = false
+MinBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    Drop.Visible = false
+    Body.Visible = not minimized
+    local dy = ((400 - 38) / 2) * Scale.Scale
+    Main.Size = minimized and UDim2.fromOffset(640, 38) or UDim2.fromOffset(640, 400)
+    Main.Position = Main.Position + UDim2.fromOffset(0, minimized and -dy or dy)
+end)
+
+local function unload()
+    State.Alive = false
+    State.Farm = false
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    pcall(function() ScreenGui:Destroy() end)
+    genv.AkumaZyroxUnload = nil
+end
+genv.AkumaZyroxUnload = unload
+
+CloseBtn.MouseButton1Click:Connect(unload)
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed then return end
+    if input.KeyCode == CONFIG.ToggleKey then
+        Main.Visible = not Main.Visible
+    end
+end)
+
+-- Base inicial
+task.spawn(function()
+    local root
+    repeat
+        root = getCharRoot()
+        task.wait(0.25)
+    until root or not State.Alive
+    if root and not State.Base then
+        State.Base = root.CFrame
+        setStatus("Pronto (base = posição inicial)")
+    end
+end)
